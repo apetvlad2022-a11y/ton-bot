@@ -11,11 +11,15 @@ CHANNEL_USERNAME = '@rusl_pay'
 TON_ADDRESS = 'UQB20fJp5OMeLtsXmf4OxrnobADEoYxBjDQfI5fROEgS1Fcl'
 DISPLAY_NAME = 'meow.ton'
 
+# === ПОРОГИ СУММ ===
+MIN_INCOMING_AMOUNT = 0.5    # Входящие от 0.5 TON
+MIN_OUTGOING_AMOUNT = 5.0    # Исходящие от 5 TON
+
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 async def get_transactions(address):
     url = f"https://tonapi.io/v2/blockchain/accounts/{address}/transactions"
-    params = {'limit': 10}
+    params = {'limit': 15}
     
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
     
@@ -36,6 +40,28 @@ async def get_transactions(address):
             print(f"Ошибка API: {e}")
             return []
 
+def check_transaction_amount(tx):
+    """Проверяет, проходит ли транзакция по порогам суммы"""
+    try:
+        msgs = tx.get('msgs', [])
+        
+        if msgs:
+            for msg in msgs:
+                msg_type = msg.get('msg_type', '')
+                value = msg.get('value', 0) / 1e9
+                
+                # Входящая транзакция
+                if msg_type == 'ext_in' and msg.get('source'):
+                    return value >= MIN_INCOMING_AMOUNT, value, "incoming"
+                
+                # Исходящая транзакция
+                elif msg_type == 'ext_out' and msg.get('destination'):
+                    return value >= MIN_OUTGOING_AMOUNT, value, "outgoing"
+        
+        return False, 0, "unknown"
+    except:
+        return False, 0, "unknown"
+
 def format_transaction_message(tx, display_name, full_address):
     try:
         tx_hash = tx.get('hash', 'unknown')
@@ -49,7 +75,6 @@ def format_transaction_message(tx, display_name, full_address):
         from_addr = "неизвестно"
         to_addr = "неизвестно"
         
-        # Получаем все сообщения в транзакции
         msgs = tx.get('msgs', [])
         
         if msgs:
@@ -57,47 +82,38 @@ def format_transaction_message(tx, display_name, full_address):
                 msg_type = msg.get('msg_type', '')
                 value = msg.get('value', 0) / 1e9
                 
-                # Входящая транзакция (кто-то отправил на наш адрес)
                 if msg_type == 'ext_in' and msg.get('source'):
                     direction = "⬇️ ВХОДЯЩЕЕ"
                     amount = value
                     from_addr = msg.get('source', 'неизвестно')
                     to_addr = display_name
                     
-                    # Форматируем адрес отправителя
                     if len(from_addr) > 10:
-                        from_short = from_addr[:6] + '...' + from_addr[-6:]
-                        from_link = f"https://tonviewer.com/{from_addr}"
-                        from_addr = f"{from_short}"
+                        from_addr = from_addr[:6] + '...' + from_addr[-6:]
                     break
                 
-                # Исходящая транзакция (мы отправили кому-то)
                 elif msg_type == 'ext_out' and msg.get('destination'):
                     direction = "⬆️ ИСХОДЯЩЕЕ"
                     amount = value
                     from_addr = display_name
                     to_addr = msg.get('destination', 'неизвестно')
                     
-                    # Форматируем адрес получателя
                     if len(to_addr) > 10:
-                        to_short = to_addr[:6] + '...' + to_addr[-6:]
-                        to_link = f"https://tonviewer.com/{to_addr}"
-                        to_addr = f"{to_short}"
+                        to_addr = to_addr[:6] + '...' + to_addr[-6:]
                     break
         
-        # Если сумма не определена, проверяем другие поля
-        if amount == 0:
-            if tx.get('total_fees'):
-                amount = tx.get('total_fees', 0) / 1e9
-        
-        # Ссылка на транзакцию
         tx_link = f"https://tonviewer.com/transaction/{tx_hash}"
         
-        # Формируем сообщение
+        # Добавляем информацию о порогах в сообщение
+        if direction == "⬇️ ВХОДЯЩЕЕ":
+            threshold_info = f"(порог: {MIN_INCOMING_AMOUNT} TON)"
+        else:
+            threshold_info = f"(порог: {MIN_OUTGOING_AMOUNT} TON)"
+        
         message = (
             f"🔔 **{direction}** на {display_name}\n"
             f"⏰ Время: {time_str}\n"
-            f"💰 Сумма: **{amount:.3f} TON**\n"
+            f"💰 Сумма: **{amount:.3f} TON** {threshold_info}\n"
             f"📤 От: `{from_addr}`\n"
             f"📥 Кому: `{to_addr}`\n"
             f"🔗 [Посмотреть транзакцию]({tx_link})"
@@ -112,7 +128,7 @@ def format_transaction_message(tx, display_name, full_address):
 async def monitor():
     print(f"🚀 Мониторинг кошелька: {DISPLAY_NAME}")
     print(f"📢 Канал: {CHANNEL_USERNAME}")
-    print(f"🔍 Полный адрес: {TON_ADDRESS}")
+    print(f"💰 Пороги: входящие ≥ {MIN_INCOMING_AMOUNT} TON, исходящие ≥ {MIN_OUTGOING_AMOUNT} TON")
     print(f"🔗 https://tonviewer.com/{TON_ADDRESS}")
     print("-" * 60)
     
@@ -127,20 +143,26 @@ async def monitor():
                 error_count = 0
                 new_txs = []
                 
-                # Ищем новые транзакции
                 for tx in txs:
                     tx_hash = tx.get('hash', '')
                     if tx_hash and tx_hash not in known_hashes:
-                        new_txs.append(tx)
+                        # Проверяем сумму перед добавлением
+                        is_valid, amount, tx_type = check_transaction_amount(tx)
+                        
+                        if is_valid:
+                            new_txs.append(tx)
+                            print(f"✅ Подходит: {tx_type}, сумма: {amount:.3f} TON")
+                        else:
+                            if amount > 0:
+                                print(f"⏭️ Пропущено ({tx_type}): {amount:.3f} TON (ниже порога)")
+                        
                         known_hashes.add(tx_hash)
                 
-                # Ограничиваем размер хранилища хэшей
                 if len(known_hashes) > 200:
                     known_hashes = set(list(known_hashes)[-100:])
                 
-                # Отправляем новые транзакции
                 if new_txs:
-                    print(f"\n🆕 Найдено {len(new_txs)} новых транзакций!")
+                    print(f"\n🆕 Найдено {len(new_txs)} новых транзакций (соответствуют порогам)!")
                     
                     for tx in new_txs:
                         msg = format_transaction_message(tx, DISPLAY_NAME, TON_ADDRESS)
@@ -153,14 +175,12 @@ async def monitor():
                                 disable_web_page_preview=True
                             )
                             
-                            # Выводим информацию в консоль
                             tx_hash = tx.get('hash', 'unknown')
                             print(f"✅ Отправлена: {tx_hash[:8]}...")
                             print(f"   Ссылка: https://tonviewer.com/transaction/{tx_hash}")
                             
                         except TelegramError as e:
                             print(f"❌ Ошибка отправки: {e}")
-                            # Пробуем отправить без Markdown
                             try:
                                 msg_plain = msg.replace('**', '').replace('`', '')
                                 await bot.send_message(
@@ -172,7 +192,7 @@ async def monitor():
                             except:
                                 pass
                         
-                        await asyncio.sleep(1)  # Пауза между сообщениями
+                        await asyncio.sleep(1)
             else:
                 error_count += 1
                 if error_count % 10 == 0:
@@ -182,7 +202,7 @@ async def monitor():
             print(f"❌ Ошибка мониторинга: {e}")
             error_count += 1
         
-        await asyncio.sleep(20)  # Проверка каждые 20 секунд
+        await asyncio.sleep(20)
 
 async def main():
     try:
